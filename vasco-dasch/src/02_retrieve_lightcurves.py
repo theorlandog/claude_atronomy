@@ -1,21 +1,29 @@
-"""Stage 2: Retrieve DASCH lightcurves for sources with plate coverage.
+"""Stage 2: Modern catalog vetting for VASCO positions.
 
-For each VASCO source that has Harvard plate coverage in 1949-1957:
-  1. Query the APASS reference catalog to find the nearest known source
-  2. Retrieve the full DASCH lightcurve using the refcat identifiers
+VASCO sources are objects that VANISHED — by definition they should NOT be in
+modern reference catalogs like APASS. This stage checks each VASCO position
+against APASS to categorize it:
 
-Results stored in SQLite:
-  - refcat_lookup: refcat IDs for each position
-  - lightcurves: full lightcurve data as JSON
+  MODERN_MATCH     — APASS source within search radius
+                     → likely a persistent star; VASCO detection may be false positive
+  TRULY_ABSENT     — no APASS source found
+                     → position is empty in modern sky; consistent with genuine transient
+                     → HIGH PRIORITY for Harvard plate inspection (Stage 4+)
+
+This information feeds directly into Stage 3 classification:
+  TRULY_ABSENT + Harvard coverage → primary candidates for FITS download
+  MODERN_MATCH → lower priority (but still worth checking Harvard plates)
+
+Results stored in SQLite: refcat_lookup table.
+Safe to resume: skips already-queried positions.
 
 Usage:
     poetry run python src/02_retrieve_lightcurves.py
 """
 
 import sys
-import yaml
 import math
-import pandas as pd
+import yaml
 from pathlib import Path
 from tqdm import tqdm
 
@@ -24,8 +32,6 @@ from utils.dasch_api import DASCHClient, parse_csv_response
 from utils.database import (
     init_db, get_positions_with_window_coverage,
     refcat_already_queried, save_refcat,
-    lightcurve_already_queried, save_lightcurve,
-    get_refcat_for_lightcurve,
 )
 
 CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
@@ -42,26 +48,20 @@ def angular_sep_arcsec(ra1, dec1, ra2, dec2) -> float:
     dra = (ra2 - ra1) * d2r
     d1 = dec1 * d2r
     d2 = dec2 * d2r
-    a = math.sin(dra / 2) ** 2 + math.cos(d1) * math.cos(d2) * math.sin(
-        (d2 - d1) / 2
-    ) ** 2
+    a = (math.sin(dra / 2) ** 2
+         + math.cos(d1) * math.cos(d2) * math.sin((d2 - d1) / 2) ** 2)
     return 2 * math.asin(min(1, math.sqrt(a))) * (180 / math.pi) * 3600
 
 
 def find_nearest_refcat(rows: list[dict], ra: float, dec: float) -> dict | None:
-    """Find nearest refcat source to (ra, dec); return the row dict."""
-    if not rows:
-        return None
     best = None
     best_sep = float("inf")
     for r in rows:
         try:
-            r_ra = float(r["ra_deg"])
-            r_dec = float(r["dec_deg"])
-            sep = angular_sep_arcsec(ra, dec, r_ra, r_dec)
+            sep = angular_sep_arcsec(ra, dec, float(r["ra_deg"]), float(r["dec_deg"]))
             if sep < best_sep:
                 best_sep = sep
-                best = r
+                best = dict(r)
                 best["_sep_arcsec"] = sep
         except (KeyError, ValueError):
             continue
@@ -76,15 +76,16 @@ def main():
     init_db()
     client = DASCHClient()
 
-    # Step 1: refcat lookup for all positions with window coverage
     positions = get_positions_with_window_coverage()
-    print(f"Stage 2a: Refcat lookup for {len(positions)} positions with coverage")
+    print(f"Stage 2: Modern catalog check (APASS) for {len(positions)} positions")
+    print(f"Search radius: {radius} arcsec | Refcat: {refcat}")
+    print(f"Science goal: TRULY_ABSENT = no APASS match = genuine transient candidate\n")
 
-    n_found = 0
-    n_not_found = 0
+    n_modern = 0
+    n_absent = 0
     n_errors = 0
 
-    with tqdm(total=len(positions), desc="Refcat lookup", unit="src") as pbar:
+    with tqdm(total=len(positions), desc="APASS lookup", unit="src") as pbar:
         for vasco_id, ra, dec in positions:
             if refcat_already_queried(vasco_id):
                 pbar.update(1)
@@ -102,53 +103,24 @@ def main():
                         sep_arcsec=nearest.get("_sep_arcsec", 0.0),
                         refcat=refcat,
                     )
-                    n_found += 1
+                    n_modern += 1
                 else:
-                    # Save a sentinel so we don't retry
+                    # No modern match — save sentinel (-1) indicating TRULY_ABSENT
                     save_refcat(vasco_id, ra, dec, -1, -1, -1.0, refcat)
-                    n_not_found += 1
+                    n_absent += 1
             except Exception as e:
-                tqdm.write(f"  ERROR refcat {vasco_id}: {e}")
-                n_errors += 1
+                tqdm.write(f"  ERROR {vasco_id}: {e}")
                 save_refcat(vasco_id, ra, dec, -1, -1, -1.0, refcat)
+                n_errors += 1
             pbar.update(1)
-            pbar.set_postfix(found=n_found, not_found=n_not_found, errors=n_errors)
+            pbar.set_postfix(modern=n_modern, absent=n_absent, errors=n_errors)
 
-    print(f"  Refcat found: {n_found}, not found: {n_not_found}, errors: {n_errors}")
-
-    # Step 2: retrieve lightcurves
-    lc_sources = get_refcat_for_lightcurve()
-    # Filter out sentinel rows (gsc_bin_index = -1)
-    lc_sources = [r for r in lc_sources if r["gsc_bin_index"] > 0]
-    print(f"\nStage 2b: Retrieving lightcurves for {len(lc_sources)} sources")
-
-    n_lc = 0
-    n_lc_errors = 0
-
-    with tqdm(total=len(lc_sources), desc="Lightcurves", unit="src") as pbar:
-        for src in lc_sources:
-            vasco_id = src["vasco_id"]
-            if lightcurve_already_queried(vasco_id):
-                pbar.update(1)
-                continue
-            try:
-                raw = client.get_lightcurve(
-                    gsc_bin_index=src["gsc_bin_index"],
-                    ref_number=src["ref_number"],
-                    refcat=src["refcat"],
-                )
-                lc = parse_csv_response(raw) if isinstance(raw, list) else []
-                save_lightcurve(vasco_id, src["ra"], src["dec"], lc)
-                n_lc += 1
-            except Exception as e:
-                tqdm.write(f"  ERROR lightcurve {vasco_id}: {e}")
-                save_lightcurve(vasco_id, src["ra"], src["dec"], [])
-                n_lc_errors += 1
-            pbar.update(1)
-            pbar.set_postfix(retrieved=n_lc, errors=n_lc_errors)
-
+    total = n_modern + n_absent
     print(f"\n=== Stage 2 Complete ===")
-    print(f"Lightcurves retrieved: {n_lc}, errors: {n_lc_errors}")
+    print(f"MODERN_MATCH  (APASS found):  {n_modern} ({100*n_modern/max(total,1):.1f}%)")
+    print(f"TRULY_ABSENT  (no APASS):     {n_absent} ({100*n_absent/max(total,1):.1f}%)")
+    print(f"Errors: {n_errors}")
+    print(f"\nTRULY_ABSENT sources with Harvard coverage are primary targets for Stage 4.")
 
 
 if __name__ == "__main__":

@@ -68,7 +68,7 @@ def get_plate_ids_for_candidates() -> list[tuple[str, str]]:
                 continue
             plates = json.loads(row["plates_json"])
             for p in plates:
-                plate_id = f"{p.get('series','')}{p.get('platenum','')}"
+                plate_id = p.get("plate_id") or f"{p.get('series','')}{int(p.get('platenum',0)):05d}"
                 if plate_id:
                     pairs.append((row["vasco_id"], plate_id))
     return pairs
@@ -122,7 +122,7 @@ def main():
             dest = FITS_DIR / f"{plate_id}_bin{bin_factor:02d}.fits"
             key = f"{plate_id}_bin{bin_factor:02d}"
             try:
-                client.download_mosaic(plate_id, bin_factor=bin_factor, dest_path=dest)
+                client.download_mosaic(plate_id, binning=bin_factor, dest_path=dest)
                 done.add(key)
                 n_ok += 1
             except Exception as e:

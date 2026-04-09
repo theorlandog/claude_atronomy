@@ -185,7 +185,17 @@ def main():
     results["test4_nuclear"] = test4_nuclear_correlation(df_nuclear)
 
     out_path = RESULTS_DIR / "statistical_tests.json"
-    out_path.write_text(json.dumps(results, indent=2))
+    # Convert numpy/python bools to plain Python types for JSON
+    def _jsonify(obj):
+        if isinstance(obj, dict):
+            return {k: _jsonify(v) for k, v in obj.items()}
+        if isinstance(obj, (bool,)):
+            return bool(obj)
+        if hasattr(obj, 'item'):  # numpy scalar
+            return obj.item()
+        return obj
+
+    out_path.write_text(json.dumps(_jsonify(results), indent=2))
 
     print(f"\n=== Stage 6 Complete ===")
     print(f"Results written to {out_path}")

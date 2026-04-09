@@ -59,16 +59,43 @@ vasco-dasch/
 
 ## Python Dependencies
 
+Managed via poetry (`pyproject.toml`). Run `poetry install` to set up the venv.
+
 ```
 daschlab        # official DASCH Python toolkit
 astropy         # coordinates, FITS, tables
 photutils       # source extraction, PSF fitting
 requests        # API calls
-pandas
-numpy
-scipy
-matplotlib
+pandas / numpy / scipy / matplotlib
+python-dotenv   # loads DASCHLAB_API_KEY from .env
+openpyxl        # reads the nuclear dataset Excel file
 ```
+
+## DASCH API — Actual Endpoints (discovered during development)
+
+**Base URL:** `https://api.starglass.cfa.harvard.edu/full` (authenticated)
+**Method:** POST with JSON body (NOT GET params)
+**Auth:** `x-api-key` header, loaded from `.env` via `DASCHLAB_API_KEY`
+**Response:** CSV-like list of strings; row 0 = column headers
+
+| Endpoint | Payload keys |
+|---|---|
+| `/dasch/dr7/queryexps` | `ra_deg`, `dec_deg` |
+| `/dasch/dr7/querycat` | `refcat`, `ra_deg`, `dec_deg`, `radius_arcsec` |
+| `/dasch/dr7/lightcurve` | `refcat`, `gsc_bin_index`, `ref_number` |
+
+**Lightcurve queries need refcat IDs** — must call `querycat` first to get
+`gsc_bin_index` + `ref_number`, then call `lightcurve` with those.
+
+**Real-world performance (measured):**
+- `queryexps`: 15–20 sec/position (large buffered Lambda response)
+- Near-polar sources (|Dec| > 88°) time out — excluded automatically
+- Config: 120s timeout, 3 retries, 0.5 req/sec, exponential backoff
+- Observed coverage: ~96% of test positions have 1949–1957 Harvard plates
+
+**Timing estimates:**
+- Vetted 5,399 sources: ~24 hours for Stage 1 (run overnight)
+- Full 107,875 sources: ~500 hours — requires batching across days
 
 ## Pipeline Stages
 
@@ -81,9 +108,10 @@ matplotlib
 ### Stage 1 — Plate Coverage Query (automated)
 - For each VASCO (RA, Dec): POST `/dasch/dr7/queryexps`, filter to 1949-11-01–1957-10-04
 - Store plate_id, obs_date, exposure_time, series, limiting_mag in SQLite
-- Rate limiting: 1–2 req/sec with exponential backoff
+- Rate limiting: 0.5 req/sec with exponential backoff; 3 retries
 - Checkpoint every 100 queries; resume skips already-queried positions
-- Vetted set: ~45 min. Full set: ~15 hours.
+- Sources at |Dec| > 88° are skipped (API timeout due to plate density)
+- **Actual timing:** vetted set ~24 hours, full set ~500 hours (multi-day batch)
 
 ### Stage 2 — Lightcurve Retrieval (automated)
 - For each position with coverage: POST `/dasch/dr7/lightcurve` with APASS catalog
@@ -149,13 +177,36 @@ After Stage 1: if fewer than 20% of VASCO positions have any DASCH coverage in
 
 At the start of each conversation, review all files in `/notes/` and summarize any new research notes, TODOs, or decisions that are relevant to the current pipeline stage.
 
-## First Evening Checklist
+## Catalog Status
 
-- [ ] `pip install daschlab astropy photutils requests pandas`
-- [ ] Register at starglass.cfa.harvard.edu, get API key
-- [ ] Join DASCH email list (dasch@gaggle.email)
+The VASCO positional catalog is **not auto-downloadable** — it must be obtained manually:
+- Go to https://doi.org/10.1038/s41598-025-21620-3 → Supplementary Information
+- Save RA/Dec table as `vasco-dasch/data/vasco_catalog/vetted_5399.csv`
+- Required columns: `ra` (deg J2000), `dec` (deg J2000)
+- A 200-source synthetic test catalog is at `data/vasco_catalog/test_200.csv`
+- The nuclear test correlation dataset is at `data/vasco_catalog/raw_nuclear_dataset.xlsx`
+
+## Running the Pipeline
+
+```bash
+cd vasco-dasch/
+poetry install                          # first time only
+poetry run python src/00_fetch_vasco_catalog.py   # validate catalog
+./run_pipeline.sh --catalog vetted      # stages 0-3 overnight
+# Then manually review candidates before:
+poetry run python src/04_download_fits.py --limit 50
+poetry run python src/05_source_extraction.py
+poetry run python src/06_statistical_analysis.py
+poetry run python src/09_generate_figures.py
+```
+
+## First Evening Checklist (✅ = already done)
+
+- [x] Register at starglass.cfa.harvard.edu, get API key → in `.env`
+- [x] `poetry install` — all dependencies installed
+- [x] `poetry run python tests/test_api_connection.py` — PASSES
+- [x] `poetry run python tests/test_coordinates.py` — PASSES
+- [x] Stage 1 tested on 200-source synthetic catalog — 96% coverage
 - [ ] Download VASCO supplementary data from Scientific Reports DOI above
-- [ ] Run: `python -c "import daschlab; print('ready')"`
-- [ ] Test: query DASCH for a known bright star's lightcurve
-- [ ] Test: query DASCH for a VASCO transient coordinate
-- [ ] Verify: does the position have Harvard plate coverage 1949–1957?
+- [ ] Join DASCH email list (dasch@gaggle.email) — optional but helpful
+- [ ] Run `./run_pipeline.sh --catalog vetted` overnight

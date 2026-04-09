@@ -68,6 +68,12 @@ def query_one(client: DASCHClient, vasco_id: str, ra: float, dec: float,
     if not isinstance(raw, list) or len(raw) < 2:
         return [], 0
     plates = parse_csv_response(raw)
+    # Add normalized plate_id in daschlab format: {series}{platenum:05d}
+    for p in plates:
+        try:
+            p["plate_id"] = f"{p['series']}{int(p['platenum']):05d}"
+        except (KeyError, ValueError):
+            p["plate_id"] = ""
     in_window = filter_to_window(plates, date_start, date_end)
     return plates, len(in_window)
 
@@ -118,6 +124,17 @@ def main():
             vasco_id = str(row.source_id)
             ra = float(row.ra)
             dec = float(row.dec)
+
+            # Skip near-polar sources: |Dec| > 88° causes API timeouts
+            # because thousands of overlapping plates exceed the Lambda response limit
+            if abs(dec) > 88.0:
+                tqdm.write(f"  SKIP polar source {vasco_id} (Dec={dec:.1f}°)")
+                save_coverage(vasco_id, ra, dec, [], 0)
+                n_errors += 1
+                pbar.update(1)
+                pbar.set_postfix(queried=n_queried, skipped=n_skipped,
+                                 coverage=n_with_coverage, errors=n_errors)
+                continue
 
             if coverage_already_queried(vasco_id):
                 n_skipped += 1

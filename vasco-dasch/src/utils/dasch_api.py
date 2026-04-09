@@ -101,18 +101,29 @@ class DASCHClient:
             "ref_number": int(ref_number),
         })
 
-    def download_mosaic(self, plate_id: str, bin_factor: int = 16,
+    def get_mosaic_url(self, plate_id: str, binning: int = 16) -> str:
+        """Get presigned S3 URL for a plate mosaic via mosaic_package API."""
+        raw = self.post("/dasch/dr7/mosaic_package", {
+            "plate_id": plate_id,
+            "binning": binning,
+        })
+        if not isinstance(raw, dict) or "baseFitsUrl" not in raw:
+            raise RuntimeError(f"Unexpected mosaic_package response for {plate_id}: {raw!r}")
+        return raw["baseFitsUrl"]
+
+    def download_mosaic(self, plate_id: str, binning: int = 16,
                         dest_path: Path = None) -> Path:
-        """Download a plate FITS mosaic."""
-        url = f"{self.base_url}/full/plates/p/{plate_id}/mosaic/download"
-        self._throttle()
-        resp = requests.get(
-            url, params={"bin_factor": bin_factor},
-            headers=self._headers(), stream=True, timeout=120
-        )
-        resp.raise_for_status()
+        """Download a plate FITS mosaic.
+
+        plate_id format: '{series}{platenum:05d}'  e.g. 'ai11826' or 'a00123'
+        binning: 1 (full res) or 16 (preview, ~1/256 data volume)
+        """
+        s3_url = self.get_mosaic_url(plate_id, binning)
         if dest_path is None:
-            dest_path = Path(f"{plate_id}_bin{bin_factor:02d}.fits")
+            dest_path = Path(f"{plate_id}_{binning:02d}.fits")
+        self._throttle()
+        resp = requests.get(s3_url, stream=True, timeout=self.timeout)
+        resp.raise_for_status()
         with open(dest_path, "wb") as f:
             for chunk in resp.iter_content(chunk_size=1 << 20):
                 f.write(chunk)
