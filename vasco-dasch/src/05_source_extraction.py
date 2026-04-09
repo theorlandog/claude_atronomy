@@ -40,24 +40,14 @@ RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 def load_candidate_positions() -> dict:
-    """Return {plate_id: (vasco_id, ra, dec)} for SINGLE_DETECTION candidates."""
+    """Return {vasco_id: (ra, dec)} for primary candidates."""
     cands_csv = RESULTS_DIR / "candidates.csv"
-    coverage_map = {}
-    if cands_csv.exists():
-        df = pd.read_csv(cands_csv)
-        singles = df[df["flag"] == "SINGLE_DETECTION"]
-        with get_conn() as conn:
-            for _, row in singles.iterrows():
-                pc = conn.execute(
-                    "SELECT plates_json FROM plate_coverage WHERE vasco_id = ?",
-                    (row["vasco_id"],)
-                ).fetchone()
-                if pc:
-                    plates = json.loads(pc["plates_json"])
-                    for p in plates:
-                        pid = f"{p.get('series','')}{p.get('platenum','')}"
-                        coverage_map[pid] = (row["vasco_id"], row["ra"], row["dec"])
-    return coverage_map
+    if not cands_csv.exists():
+        return {}
+    df = pd.read_csv(cands_csv)
+    primary_flags = {"TRULY_ABSENT_WITH_COVERAGE", "MODERN_MATCH_WITH_COVERAGE"}
+    primaries = df[df["flag"].isin(primary_flags)]
+    return {row["vasco_id"]: (row["ra"], row["dec"]) for _, row in primaries.iterrows()}
 
 
 def analyze_plate(fits_path: Path, cand_ra: float, cand_dec: float,
@@ -152,7 +142,7 @@ def main():
                         help="Flag candidate if FWHM ratio < threshold (default 0.5)")
     args = parser.parse_args()
 
-    fits_files = sorted(FITS_DIR.glob("*.fits"))
+    fits_files = sorted(FITS_DIR.glob("**/*.fits"))
     if not fits_files:
         print(f"No FITS files found in {FITS_DIR}")
         print("Run Stage 4 first to download plate mosaics.")
@@ -166,12 +156,14 @@ def main():
 
     with tqdm(total=len(fits_files), unit="plate") as pbar:
         for fits_path in fits_files:
-            plate_id = fits_path.stem.replace("_bin16", "").replace("_bin01", "")
-            lookup = cand_map.get(plate_id)
+            # Directory name is vasco_id; strip _16 or _01 binning suffix from stem
+            vasco_id = fits_path.parent.name
+            plate_id = fits_path.stem.rsplit("_", 1)[0]  # "kf00038_16" → "kf00038"
+            lookup = cand_map.get(vasco_id)
             if lookup is None:
                 pbar.update(1)
                 continue
-            vasco_id, cand_ra, cand_dec = lookup
+            cand_ra, cand_dec = lookup
 
             result = analyze_plate(fits_path, cand_ra, cand_dec, args.fwhm_threshold)
             if result is None:
@@ -181,6 +173,7 @@ def main():
             rec = {
                 "plate_id": plate_id,
                 "vasco_id": vasco_id,
+                "fits_file": fits_path.name,
                 "cand_ra": cand_ra,
                 "cand_dec": cand_dec,
                 **result,

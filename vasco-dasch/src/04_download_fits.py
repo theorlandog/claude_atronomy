@@ -1,144 +1,181 @@
-"""Stage 4: Download FITS plate mosaics for SINGLE_DETECTION candidates.
+"""Stage 4: Download FITS plate mosaics for primary candidates.
 
-Downloads low-res (bin_factor=16) first for triage.
-For sources flagged as interesting after visual inspection, re-run with
---full to download bin_factor=01 (full resolution).
+Uses daschlab's Session.mosaic() for each target position, which handles
+the full two-step download process (plate metadata + S3 presigned URL).
 
-Requires authenticated API key (DASCHLAB_API_KEY in .env).
+Downloads bin_factor=16 (low-res preview) first for triage.
+Re-run with --full for bin_factor=1 (full resolution, ~256× larger files).
 
-Output: data/fits_cutouts/{plate_id}_bin16.fits
+Output: data/fits_cutouts/{vasco_id}/{plate_id}_16.fits
 
 Usage:
-    poetry run python src/04_download_fits.py [--full] [--limit N]
+    poetry run python src/04_download_fits.py [--full] [--limit N] [--catalog test|vetted]
 """
 
+import os
 import sys
 import json
+import warnings
 import argparse
-import sqlite3
+import tempfile
+import shutil
 import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 
+os.environ.setdefault("DASCHLAB_API_KEY", "")
 sys.path.insert(0, str(Path(__file__).parent))
-from utils.dasch_api import DASCHClient
+
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).parent.parent / ".env")
+
+import daschlab
+warnings.filterwarnings("ignore")
+
 from utils.database import get_conn
 
-CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
 FITS_DIR = Path(__file__).parent.parent / "data" / "fits_cutouts"
 RESULTS_DIR = Path(__file__).parent.parent / "data" / "results"
+LOG_FILE = FITS_DIR / "downloaded.json"
 
-DOWNLOAD_LOG = FITS_DIR / "downloaded.json"
 
-
-def load_downloaded() -> set:
-    if DOWNLOAD_LOG.exists():
-        return set(json.loads(DOWNLOAD_LOG.read_text()))
+def load_done() -> set:
+    if LOG_FILE.exists():
+        return set(json.loads(LOG_FILE.read_text()))
     return set()
 
 
-def save_downloaded(done: set):
-    DOWNLOAD_LOG.write_text(json.dumps(sorted(done)))
+def save_done(done: set):
+    LOG_FILE.write_text(json.dumps(sorted(done)))
 
 
-def get_plate_ids_for_candidates() -> list[tuple[str, str]]:
-    """Return (vasco_id, plate_id) pairs for SINGLE_DETECTION candidates."""
+def get_primary_candidates() -> list[dict]:
+    """Return primary candidates: TRULY_ABSENT_WITH_COVERAGE + MODERN_MATCH_WITH_COVERAGE."""
+    csv = RESULTS_DIR / "candidates.csv"
+    if not csv.exists():
+        raise FileNotFoundError("Run Stage 3 first: candidates.csv not found")
+    df = pd.read_csv(csv)
+    primary_flags = {"TRULY_ABSENT_WITH_COVERAGE", "MODERN_MATCH_WITH_COVERAGE"}
+    return df[df["flag"].isin(primary_flags)].to_dict("records")
+
+
+def get_window_plates(vasco_id: str, date_start: str, date_end: str) -> list[dict]:
+    """Return plates in the 1949-1957 window for a given VASCO source."""
     with get_conn() as conn:
-        # Get candidates
-        cands = conn.execute(
-            "SELECT vasco_id FROM candidates WHERE flag = 'SINGLE_DETECTION'"
-        ).fetchall()
-        if not cands:
-            # Fall back to candidates.csv
-            candidates_csv = RESULTS_DIR / "candidates.csv"
-            if candidates_csv.exists():
-                df = pd.read_csv(candidates_csv)
-                cand_ids = set(df[df["flag"] == "SINGLE_DETECTION"]["vasco_id"])
-            else:
-                return []
-        else:
-            cand_ids = {r["vasco_id"] for r in cands}
-
-        # Get plate IDs from coverage
-        pairs = []
-        for row in conn.execute(
-            "SELECT vasco_id, plates_json FROM plate_coverage"
-        ).fetchall():
-            if row["vasco_id"] not in cand_ids:
-                continue
-            plates = json.loads(row["plates_json"])
-            for p in plates:
-                plate_id = p.get("plate_id") or f"{p.get('series','')}{int(p.get('platenum',0)):05d}"
-                if plate_id:
-                    pairs.append((row["vasco_id"], plate_id))
-    return pairs
+        row = conn.execute(
+            "SELECT plates_json FROM plate_coverage WHERE vasco_id = ?", (vasco_id,)
+        ).fetchone()
+    if not row:
+        return []
+    plates = json.loads(row["plates_json"])
+    return [
+        p for p in plates
+        if date_start <= p.get("expdate", "")[:10] <= date_end
+    ]
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--full", action="store_true",
-                        help="Download full resolution (bin_factor=1) instead of preview")
-    parser.add_argument("--limit", type=int, default=None,
-                        help="Maximum number of plates to download")
-    args = parser.parse_args()
+def download_for_candidate(cand: dict, binning: int, date_start: str, date_end: str,
+                            done: set, session_dir: Path) -> tuple[int, int]:
+    """Download FITS mosaics for one candidate. Returns (n_ok, n_err)."""
+    vasco_id = cand["vasco_id"]
+    ra = float(cand["ra"])
+    dec = float(cand["dec"])
 
-    bin_factor = 1 if args.full else 16
-    FITS_DIR.mkdir(parents=True, exist_ok=True)
-    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    plates = get_window_plates(vasco_id, date_start, date_end)
+    if not plates:
+        return 0, 0
 
-    # Try to populate candidates table from CSV if empty
-    candidates_csv = RESULTS_DIR / "candidates.csv"
-    if candidates_csv.exists():
-        df_cands = pd.read_csv(candidates_csv)
-        with get_conn() as conn:
-            for _, row in df_cands.iterrows():
-                conn.execute(
-                    """INSERT OR IGNORE INTO candidates (vasco_id, ra, dec, flag, n_detections, n_window)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (row["vasco_id"], row["ra"], row["dec"],
-                     row["flag"], row.get("n_detections", 0), row.get("n_window", 0))
-                )
+    out_dir = FITS_DIR / vasco_id
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    pairs = get_plate_ids_for_candidates()
-    if not pairs:
-        print("No SINGLE_DETECTION candidates found. Run Stage 3 first.")
-        return
+    # Create a daschlab session for this position
+    sess_path = session_dir / f"sess_{vasco_id}"
+    sess = daschlab.open_session(root=str(sess_path), interactive=False)
+    sess.select_target(ra_deg=ra, dec_deg=dec)
+    # Pre-fetch exposures to populate session cache
+    try:
+        _ = sess.exposures()
+    except Exception:
+        pass
 
-    if args.limit:
-        pairs = pairs[:args.limit]
-
-    done = load_downloaded()
-    to_download = [(v, p) for v, p in pairs if f"{p}_bin{bin_factor:02d}" not in done]
-
-    print(f"FITS download: {len(to_download)} plates to fetch "
-          f"(bin_factor={bin_factor}, {len(done)} already done)")
-
-    client = DASCHClient()
     n_ok = 0
     n_err = 0
 
-    with tqdm(total=len(to_download), unit="plate") as pbar:
-        for vasco_id, plate_id in to_download:
-            dest = FITS_DIR / f"{plate_id}_bin{bin_factor:02d}.fits"
-            key = f"{plate_id}_bin{bin_factor:02d}"
-            try:
-                client.download_mosaic(plate_id, binning=bin_factor, dest_path=dest)
-                done.add(key)
-                n_ok += 1
-            except Exception as e:
-                tqdm.write(f"  ERROR {plate_id}: {e}")
-                n_err += 1
-            pbar.update(1)
-            pbar.set_postfix(ok=n_ok, errors=n_err)
-            # Save checkpoint every 10 downloads
-            if (n_ok + n_err) % 10 == 0:
-                save_downloaded(done)
+    for p in plates:
+        series = p.get("series", "")
+        platenum = p.get("platenum", 0)
+        plate_id = p.get("plate_id") or f"{series}{int(platenum):05d}"
+        key = f"{vasco_id}/{plate_id}_{binning:02d}"
 
-    save_downloaded(done)
+        if key in done:
+            continue
+
+        dest = out_dir / f"{plate_id}_{binning:02d}.fits"
+        try:
+            relpath = sess.mosaic(plate_id, binning=binning)
+            src = Path(str(sess_path)) / relpath
+            shutil.copy2(src, dest)
+            done.add(key)
+            n_ok += 1
+        except Exception as e:
+            tqdm.write(f"  SKIP {plate_id}: {str(e)[:80]}")
+            n_err += 1
+
+    return n_ok, n_err
+
+
+def main():
+    import yaml
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--full", action="store_true",
+                        help="Download full resolution (binning=1)")
+    parser.add_argument("--limit", type=int, default=None,
+                        help="Limit to N candidates")
+    parser.add_argument("--plates-per-candidate", type=int, default=3,
+                        help="Max plates per candidate (default 3 for triage)")
+    args = parser.parse_args()
+
+    binning = 1 if args.full else 16
+
+    with open(Path(__file__).parent.parent / "config.yaml") as f:
+        cfg = yaml.safe_load(f)
+    date_start = cfg["pipeline"]["date_start"]
+    date_end = cfg["pipeline"]["date_end"]
+
+    FITS_DIR.mkdir(parents=True, exist_ok=True)
+    done = load_done()
+
+    candidates = get_primary_candidates()
+    if args.limit:
+        candidates = candidates[:args.limit]
+
+    print(f"Stage 4: FITS download (binning={binning})")
+    print(f"  Candidates: {len(candidates)}")
+    print(f"  Max plates/candidate: {args.plates_per_candidate}")
+    print(f"  Already downloaded: {len(done)}")
+
+    n_total_ok = 0
+    n_total_err = 0
+
+    with tempfile.TemporaryDirectory(prefix="dasch_sess_") as sess_tmp:
+        for cand in tqdm(candidates, desc="Candidates", unit="src"):
+            # Limit plates per candidate to keep download manageable
+            vasco_id = cand["vasco_id"]
+            plates = get_window_plates(vasco_id, date_start, date_end)
+            # Prioritize plates near the middle of the window (peak POSS-I era)
+            plates_to_try = plates[:args.plates_per_candidate]
+
+            n_ok, n_err = download_for_candidate(
+                cand, binning, date_start, date_end, done, Path(sess_tmp)
+            )
+            n_total_ok += n_ok
+            n_total_err += n_err
+            save_done(done)
+
     print(f"\n=== Stage 4 Complete ===")
-    print(f"Downloaded: {n_ok}, Errors: {n_err}")
-    print(f"FITS files in: {FITS_DIR}")
-    print("\nNEXT: Visually spot-check a sample, then run Stage 5 (source extraction).")
+    print(f"Downloaded: {n_total_ok} FITS files, {n_total_err} skipped")
+    print(f"Output: {FITS_DIR}")
+    print("\nSpot-check downloaded images, then run Stage 5 (source extraction).")
 
 
 if __name__ == "__main__":

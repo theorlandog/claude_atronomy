@@ -86,27 +86,135 @@ nine-transient position, near plate center where image quality is best.
 
 ---
 
+## Later progress (continued)
+
+### Completed
+- [x] Sign up at starglass.cfa.harvard.edu/signin
+- [x] Get API key from user profile
+- [x] Install daschlab via poetry (`pyproject.toml`)
+- [x] Full 10-stage pipeline built and tested on 200-source synthetic catalog
+- [x] VASCO vetted catalog (5,399 sources) downloaded from SVO ConeSearch
+- [x] Stage 1 running on vetted catalog (~24 hour ETA)
+- [x] Stage 4 test FITS downloads running (~32 hour ETA)
+- [x] Stage 5 source extraction tested and bugs fixed
+
+### VASCO catalog obtained
+The vetted 5,399-source catalog was downloaded from the Spanish Virtual Observatory:
+- **URL:** `http://svocats.cab.inta-csic.es/vanish-possi/`
+- **Method:** ConeSearch VO protocol (`cs.php?RA=180&DEC=0&SR=180&VERB=2`)
+- **Saved to:** `data/vasco_catalog/vetted_5399.csv`
+- **Source:** Solano et al. (2022), MNRAS 515, 1380
+
+The full 107,875-source catalog (Bruehl & Villarroel 2025) is **not publicly available** —
+must be requested from the authors (stephen.bruehl@vumc.org or Beatriz Villarroel).
+
+### DASCH API corrections (from Night 1 plan)
+The plan had the API wrong. Actual API:
+- **Base URL:** `https://api.starglass.cfa.harvard.edu/full`
+- **Method:** POST with JSON body (NOT GET with query params)
+- **Auth:** `x-api-key` header from `DASCHLAB_API_KEY` env var (set in `.env`)
+- **Response:** CSV-like list of strings; row 0 = column headers
+- **Performance:** 15–20 sec/position for `queryexps` (Lambda buffered response)
+- Near-polar sources (|Dec| > 88°) time out — excluded automatically
+
+### Science redesign: Stage 2
+The original plan said "retrieve DASCH lightcurves for VASCO positions." This was wrong —
+VASCO sources vanished and are NOT in modern APASS. Lightcurves require catalog IDs.
+
+Stage 2 redesigned as **APASS modern catalog check**:
+- APASS match → persistent star → VASCO false positive
+- No APASS match → genuinely absent → genuine transient candidate
+
+Classification (Stage 3):
+- `TRULY_ABSENT_WITH_COVERAGE` — no APASS + Harvard plates → **PRIMARY TARGETS**
+- `MODERN_MATCH_WITH_COVERAGE` — APASS match + Harvard plates → likely false positive
+- `TRULY_ABSENT_NO_COVERAGE` / `MODERN_MATCH_NO_COVERAGE` — lower priority
+
+### Stage 5 bugs fixed
+1. `glob("*.fits")` missed files in subdirectories → `glob("**/*.fits")`
+2. Filename stripping (`_bin16`) didn't match actual format (`_16`) → `rsplit("_", 1)[0]`
+3. Filtered on `SINGLE_DETECTION` (a Stage 5 output) → now uses Stage 3 primary flags
+
+### Pipeline test results (200-source synthetic catalog)
+| Metric | Value |
+|---|---|
+| Harvard coverage (1949-1957) | **88%** of queried positions (59/200 so far) |
+| Plates per position (median) | **~1,455** in the 8-year window |
+| APASS matches | 0/48 with coverage (0%) |
+| Primary candidates | **45/54 = 83%** TRULY_ABSENT_WITH_COVERAGE |
+| Nuclear test correlation | rate ratio 1.37, p=0.20 (not significant alone) |
+
+### Plate series depth analysis (critical finding)
+
+**The b-series is NOT the best plate for the 1949–1957 window.**
+
+Measured limiting magnitudes from DASCH `limMagApass` field for window plates:
+
+| Series | Median lim mag | VASCO detectable? | Window plates (52 pos) |
+|--------|---------------|-------------------|------------------------|
+| mc (Metcalf) | 17.0 | **Yes — best** | 233 |
+| mf | 16.4 | **Yes** | 389 |
+| rb | 15.8 | **Marginal** | 585 |
+| b (Bache) | 15.3 | **Marginal** | 325 |
+| rh | 15.0 | **Barely** | 1,772 |
+| ac | 14.1 | No | 7,419 |
+| ai/fa/ka | 11.9–12.1 | No | ~33,000 each |
+
+The b-series peaked in 1885–1920 and was winding down by 1949:
+
+| Decade | b-series plates |
+|--------|----------------|
+| 1880s | 1,561 |
+| 1890s | 4,116 |
+| 1900s | 4,923 |
+| 1910s | 2,867 |
+| 1920s | 34 |
+| 1930s | 1,338 |
+| 1940s | 1,366 |
+| 1950s | 308 |
+
+**For FITS downloads, prioritize mc + mf + rb + b series.** These are the only
+series with limiting magnitudes reaching VASCO transient brightness (mag 15–16).
+
+### FITS download strategy
+
+Disk: 293 GB free, 30 GB reserved = 263 GB usable.
+
+Full vetted catalog at all window plates: **~20 TB** — impossible.
+Deep plates only (mc+mf+rb+b): ~9.3 per position × 4,400 primaries × 3 MB = **~120 GB** — fits.
+These plate counts are already position-filtered (queryexps returns only plates covering each RA/Dec).
+
+Plan:
+1. Let test-catalog Stage 4 finish (~196 GB, synthetic — useful for testing only)
+2. Delete test FITS to free space
+3. Run vetted Stage 4 filtered to mc+mf+rb+b series only (~120 GB)
+
+### Processes running
+- **Stage 1 (test):** PID 84697, ~59/200 sources, ~1 hour remaining
+- **Stage 1 (vetted):** PID 108198, 5,399 sources, ~24 hours
+- **Stage 4 (test):** PID 98367, downloading FITS, ~32 hours
+
+---
+
 ## Next steps
 
-### Immediate (tonight or tomorrow)
-- [ ] Sign up at starglass.cfa.harvard.edu/signin
-- [ ] Get API key from user profile
-- [ ] Download FITS mosaic for b76115 (best plate closest to VASCO events)
-- [ ] Install daschlab: `pip install daschlab`
-- [ ] Run daschlab Session query at VASCO coordinates to compare with StarGlass results
+### After Stage 1 (vetted) completes (~April 10)
+- [ ] Run Stages 2→3 on vetted catalog to classify all 5,399 sources
+- [ ] Delete test FITS data to free ~196 GB
+- [ ] Add series filter to Stage 4 (mc+mf+rb+b only)
+- [ ] Run Stage 4 on vetted primaries (~120 GB, ~14 hours)
+- [ ] Run Stage 5 PSF analysis on deep plates
+- [ ] Visual inspection of flagged candidates (critical human step)
+- [ ] Re-run Stage 6 with real detections
 
-### This week
-- [ ] Download VASCO supplementary data from DOI: 10.1038/s41598-025-21620-3
-- [ ] Get the Solano et al. (2022) vetted 5,399-source catalog
-- [ ] Run source extraction on b76115 FITS with photutils
-- [ ] Check if any extracted sources coincide with known VASCO transient positions
+### Remaining code work
+- Stage 4 needs series filter (currently downloads all window plates)
+- Statistical tests 2 (spatial) and 3 (shadow) need Stage 5 detections
+- Figure 4 (lightcurve examples) not yet implemented
 
-### Project architecture
-- Full pipeline plan saved as: vasco_dasch_project_plan.md
-- Claude Code can automate stages 1–6
-- Estimated total effort: 40–60 hours over ~10 weeks
-- All data access is free
-- Publishable in RNAAS, PASP, MNRAS, or Scientific Reports
+### Longer term
+- [ ] Email Bruehl/Villarroel for full 107k catalog
+- [ ] Join DASCH mailing list (dasch@gaggle.email)
 
 ---
 
@@ -115,16 +223,6 @@ nine-transient position, near plate center where image quality is best.
 - StarGlass API docs: https://starglass.cfa.harvard.edu/docs/api/
 - DASCH DR7: https://dasch.cfa.harvard.edu/dr7/
 - daschlab docs: https://daschlab.readthedocs.io
-- VASCO data: DOI 10.1038/s41598-025-21620-3
+- VASCO vetted catalog: http://svocats.cab.inta-csic.es/vanish-possi/
+- VASCO paper: DOI 10.1038/s41598-025-21620-3
 - DASCH mailing list: dasch@gaggle.email
-
----
-
-## Important caveat
-The 1.5-inch patrol cameras (majority of the 1,400 plates) almost certainly
-cannot reach VASCO transient magnitudes (15–16). The 8-inch Bache Doublet
-plates are the viable ones for direct transient detection. The patrol plates
-are still useful for the rate comparison test at brighter magnitudes, but the
-core science case rests on the 11 Bache plates plus any other deep plates
-from larger Harvard telescopes that may be in the list (rh, mc series — not
-yet characterized).
