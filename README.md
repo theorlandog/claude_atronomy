@@ -188,14 +188,6 @@ So Stage 4 filters to `mc`, `mf`, `rb`, `b`. This keeps every plate that *could*
 detect a VASCO transient and discards plates that *couldn't*, regardless of how
 numerous they are.
 
-**Note on the Bache (`b`) series.** A Night-1 hand-analysis of the
-nine-transient field initially highlighted the 8-inch Bache Doublet as the
-closest analogue to Palomar's 48-inch Schmidt. That intuition turned out to be
-only partly right: the b-series peaked in 1885–1920 and had wound down to ~308
-plates in the 1950s, so it contributes far less coverage in the VASCO window
-than `mc` or `mf`. We keep it in the filter because its depth (mag 15.3) is
-still in range, but `mc` and `mf` are the workhorses.
-
 ## Status
 
 Stage 1 is currently running on the vetted 5,399-source catalog with 4 parallel
