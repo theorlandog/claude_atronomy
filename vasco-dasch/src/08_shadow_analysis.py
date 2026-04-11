@@ -1,10 +1,11 @@
-"""Stage 8: Earth shadow deficit analysis.
+"""Stage 8: Earth shadow deficit analysis on Harvard transients.
 
-Tests whether VASCO / Harvard transients are deficient in the antisolar
-direction (Earth's umbral shadow cone, ~1.4% of sky).
+Tests whether Harvard transients (from Stage 5) show the same shadow
+deficit as VASCO — i.e., fewer transients in the antisolar direction
+(Earth's umbral shadow cone, ~1.4% of sky).
 
-If transients are satellite glints or near-Earth objects, they would be
-suppressed in the shadow cone. This is one of the VASCO project's own tests.
+This is an independent test: different telescope, different plates,
+different source extraction.
 
 Usage:
     poetry run python src/08_shadow_analysis.py
@@ -13,7 +14,6 @@ Usage:
 import sys
 import json
 import numpy as np
-import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -24,89 +24,82 @@ from astropy.coordinates import get_sun, SkyCoord
 import astropy.units as u
 
 sys.path.insert(0, str(Path(__file__).parent))
+from utils.database import get_harvard_transients
 from utils.statistics import earth_shadow_test
 
 RESULTS_DIR = Path(__file__).parent.parent / "data" / "results"
 
 
-def get_solar_elongation(ra_deg: float, dec_deg: float, utc_date: str) -> float | None:
-    """Return solar elongation in degrees for a source at a given date."""
-    try:
-        t = Time(utc_date)
-        sun = get_sun(t)
-        src = SkyCoord(ra=ra_deg * u.deg, dec=dec_deg * u.deg, frame="icrs")
-        return float(sun.separation(src).deg)
-    except Exception:
-        return None
-
-
 def main():
-    cands_csv = RESULTS_DIR / "candidates.csv"
-    if not cands_csv.exists():
-        print("Run Stage 3 first.")
+    transients = get_harvard_transients()
+
+    print(f"Earth shadow analysis (Harvard transients)")
+    print(f"  Total transients: {len(transients)}")
+
+    # Filter to those with valid expdates
+    with_dates = [t for t in transients if t.get("expdate")]
+    print(f"  With observation dates: {len(with_dates)}")
+
+    if len(with_dates) == 0:
+        print("  No transients with dates — cannot run shadow test.")
         return
 
-    df = pd.read_csv(cands_csv)
-    singles = df[df["flag"] == "SINGLE_DETECTION"].copy()
-
-    print(f"Earth shadow analysis")
-    print(f"  Single-detection candidates: {len(singles)}")
-
-    if "utc_date" not in singles.columns:
-        print("  No UTC date column — cannot run shadow test.")
-        print("  Shadow test requires observation dates in the catalog.")
-        return
-
-    singles = singles.dropna(subset=["utc_date"])
-    if len(singles) == 0:
-        print("  No candidates with observation dates.")
-        return
+    ra_list = np.array([t["ra"] for t in with_dates])
+    dec_list = np.array([t["dec"] for t in with_dates])
+    dates = [t["expdate"] for t in with_dates]
 
     # Compute solar elongations
-    singles["solar_elongation"] = singles.apply(
-        lambda r: get_solar_elongation(r["ra"], r["dec"], r["utc_date"]), axis=1
-    )
-    singles = singles.dropna(subset=["solar_elongation"])
-    print(f"  Sources with valid elongations: {len(singles)}")
+    elongations = []
+    for ra, dec, date_str in zip(ra_list, dec_list, dates):
+        try:
+            t = Time(date_str)
+            sun = get_sun(t)
+            src = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
+            elongations.append(float(sun.separation(src).deg))
+        except Exception:
+            elongations.append(np.nan)
 
-    if len(singles) == 0:
+    elongations = np.array(elongations)
+    valid = np.isfinite(elongations)
+    print(f"  Valid elongations: {valid.sum()}")
+
+    if valid.sum() == 0:
         print("  Insufficient data for shadow test.")
         return
 
-    # Shadow cone: antisolar direction ± ~0.27 deg (half-angle)
-    SHADOW_THRESHOLD = 179.73  # elongation > this → in shadow
-    in_shadow = singles["solar_elongation"] > SHADOW_THRESHOLD
+    # Shadow cone threshold
+    SHADOW_THRESHOLD = 179.73
+    in_shadow = elongations[valid] > SHADOW_THRESHOLD
     n_shadow = int(in_shadow.sum())
-    n_total = len(singles)
+    n_total = int(valid.sum())
     frac_obs = n_shadow / n_total
     frac_exp = 0.014
 
     print(f"\nShadow cone analysis:")
-    print(f"  In shadow: {n_shadow} / {n_total} = {frac_obs:.3f}")
+    print(f"  In shadow: {n_shadow} / {n_total} = {frac_obs:.4f}")
     print(f"  Expected (geometric): {frac_exp:.3f}")
 
-    # Statistical test
     result = earth_shadow_test(
-        obs_times_utc=singles["utc_date"].tolist(),
-        ra_list=singles["ra"].values,
-        dec_list=singles["dec"].values,
+        obs_times_utc=list(np.array(dates)[valid]),
+        ra_list=ra_list[valid],
+        dec_list=dec_list[valid],
     )
-    print(f"  Chi-square: {result.get('chi2','?')}, p={result.get('p_value','?')}")
-    print(f"  Significant deficit: {result.get('significant',False)}")
+    print(f"  Chi-square: {result.get('chi2', '?')}, p={result.get('p_value', '?')}")
+    print(f"  Significant deficit: {result.get('significant', False)}")
 
-    # Save result
     out = RESULTS_DIR / "shadow_analysis.json"
-    out.write_text(json.dumps(result, indent=2))
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(result, indent=2, default=str))
 
-    # Plot elongation distribution
+    # Plot
     fig, ax = plt.subplots(figsize=(7, 4))
-    ax.hist(singles["solar_elongation"], bins=36, range=(0, 180),
+    ax.hist(elongations[valid], bins=36, range=(0, 180),
             color="steelblue", edgecolor="white")
     ax.axvline(SHADOW_THRESHOLD, color="red", linestyle="--",
                label=f"Shadow threshold ({SHADOW_THRESHOLD}°)")
     ax.set_xlabel("Solar elongation (degrees)")
-    ax.set_ylabel("Number of candidates")
-    ax.set_title("Solar Elongation Distribution of Single-Detection Candidates")
+    ax.set_ylabel("Number of transients")
+    ax.set_title("Solar Elongation Distribution — Harvard Transients")
     ax.legend()
     fig.tight_layout()
 

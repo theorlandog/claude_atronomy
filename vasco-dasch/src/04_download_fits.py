@@ -1,15 +1,12 @@
-"""Stage 4: Download FITS plate mosaics for primary candidates.
+"""Stage 4: Download FITS plate mosaics for consecutive plate pairs.
 
-Uses daschlab's Session.mosaic() for each target position, which handles
-the full two-step download process (plate metadata + S3 presigned URL).
+For each unique consecutive pair from a deep series (mc, mf, rb, b),
+downloads both plates at bin_factor=16 for transient detection in Stage 5.
 
-Downloads bin_factor=16 (low-res preview) first for triage.
-Re-run with --full for bin_factor=1 (full resolution, ~256× larger files).
-
-Output: data/fits_cutouts/{vasco_id}/{plate_id}_16.fits
+Output: data/fits_cutouts/{pair_id}/{plate_id}_16.fits
 
 Usage:
-    poetry run python src/04_download_fits.py [--full] [--limit N] [--catalog test|vetted]
+    poetry run python src/04_download_fits.py [--full] [--limit N]
 """
 
 import os
@@ -19,7 +16,6 @@ import warnings
 import argparse
 import tempfile
 import shutil
-import pandas as pd
 from pathlib import Path
 from tqdm import tqdm
 
@@ -32,10 +28,9 @@ load_dotenv(Path(__file__).parent.parent / ".env")
 import daschlab
 warnings.filterwarnings("ignore")
 
-from utils.database import get_conn
+from utils.plate_pairs import get_all_unique_pairs
 
 FITS_DIR = Path(__file__).parent.parent / "data" / "fits_cutouts"
-RESULTS_DIR = Path(__file__).parent.parent / "data" / "results"
 LOG_FILE = FITS_DIR / "downloaded.json"
 
 
@@ -49,133 +44,94 @@ def save_done(done: set):
     LOG_FILE.write_text(json.dumps(sorted(done)))
 
 
-def get_primary_candidates() -> list[dict]:
-    """Return primary candidates: TRULY_ABSENT_WITH_COVERAGE + MODERN_MATCH_WITH_COVERAGE."""
-    csv = RESULTS_DIR / "candidates.csv"
-    if not csv.exists():
-        raise FileNotFoundError("Run Stage 3 first: candidates.csv not found")
-    df = pd.read_csv(csv)
-    primary_flags = {"TRULY_ABSENT_WITH_COVERAGE", "MODERN_MATCH_WITH_COVERAGE"}
-    return df[df["flag"].isin(primary_flags)].to_dict("records")
+def make_pair_id(plate_a: dict, plate_b: dict) -> str:
+    series = plate_a.get("series", "unk")
+    pid_a = plate_a.get("plate_id") or f"{plate_a['series']}{int(plate_a['platenum']):05d}"
+    pid_b = plate_b.get("plate_id") or f"{plate_b['series']}{int(plate_b['platenum']):05d}"
+    return f"{series}_{pid_a}_{pid_b}"
 
 
-def get_window_plates(vasco_id: str, date_start: str, date_end: str) -> list[dict]:
-    """Return plates in the 1949-1957 window for a given VASCO source."""
-    with get_conn() as conn:
-        row = conn.execute(
-            "SELECT plates_json FROM plate_coverage WHERE vasco_id = ?", (vasco_id,)
-        ).fetchone()
-    if not row:
-        return []
-    plates = json.loads(row["plates_json"])
-    return [
-        p for p in plates
-        if date_start <= p.get("expdate", "")[:10] <= date_end
-    ]
-
-
-def download_for_candidate(cand: dict, binning: int, date_start: str, date_end: str,
-                            done: set, session_dir: Path) -> tuple[int, int]:
-    """Download FITS mosaics for one candidate. Returns (n_ok, n_err)."""
-    vasco_id = cand["vasco_id"]
-    ra = float(cand["ra"])
-    dec = float(cand["dec"])
-
-    plates = get_window_plates(vasco_id, date_start, date_end)
-    if not plates:
-        return 0, 0
-
-    out_dir = FITS_DIR / vasco_id
-    out_dir.mkdir(parents=True, exist_ok=True)
-
-    # Create a daschlab session for this position
-    sess_path = session_dir / f"sess_{vasco_id}"
-    sess = daschlab.open_session(root=str(sess_path), interactive=False)
-    sess.select_target(ra_deg=ra, dec_deg=dec)
-    # Pre-fetch exposures to populate session cache
+def download_plate(sess, plate: dict, binning: int, dest: Path,
+                   sess_path: Path) -> bool:
+    """Download one plate FITS. Returns True on success."""
+    pid = plate.get("plate_id") or f"{plate['series']}{int(plate['platenum']):05d}"
     try:
-        _ = sess.exposures()
-    except Exception:
-        pass
-
-    n_ok = 0
-    n_err = 0
-
-    for p in plates:
-        series = p.get("series", "")
-        platenum = p.get("platenum", 0)
-        plate_id = p.get("plate_id") or f"{series}{int(platenum):05d}"
-        key = f"{vasco_id}/{plate_id}_{binning:02d}"
-
-        if key in done:
-            continue
-
-        dest = out_dir / f"{plate_id}_{binning:02d}.fits"
-        try:
-            relpath = sess.mosaic(plate_id, binning=binning)
-            src = Path(str(sess_path)) / relpath
-            shutil.copy2(src, dest)
-            done.add(key)
-            n_ok += 1
-        except Exception as e:
-            tqdm.write(f"  SKIP {plate_id}: {str(e)[:80]}")
-            n_err += 1
-
-    return n_ok, n_err
+        relpath = sess.mosaic(pid, binning=binning)
+        src = Path(str(sess_path)) / relpath
+        shutil.copy2(src, dest)
+        return True
+    except Exception as e:
+        tqdm.write(f"  SKIP {pid}: {str(e)[:80]}")
+        return False
 
 
 def main():
-    import yaml
     parser = argparse.ArgumentParser()
     parser.add_argument("--full", action="store_true",
                         help="Download full resolution (binning=1)")
     parser.add_argument("--limit", type=int, default=None,
-                        help="Limit to N candidates")
-    parser.add_argument("--plates-per-candidate", type=int, default=3,
-                        help="Max plates per candidate (default 3 for triage)")
+                        help="Limit to N pairs")
+    parser.add_argument("--max-gap-days", type=int, default=30,
+                        help="Max days between consecutive plates (default 30)")
     args = parser.parse_args()
 
     binning = 1 if args.full else 16
-
-    with open(Path(__file__).parent.parent / "config.yaml") as f:
-        cfg = yaml.safe_load(f)
-    date_start = cfg["pipeline"]["date_start"]
-    date_end = cfg["pipeline"]["date_end"]
-
     FITS_DIR.mkdir(parents=True, exist_ok=True)
     done = load_done()
 
-    candidates = get_primary_candidates()
+    print(f"Stage 4: Building consecutive plate pairs (max gap: {args.max_gap_days} days)...")
+    all_pairs = get_all_unique_pairs(max_gap_days=args.max_gap_days)
     if args.limit:
-        candidates = candidates[:args.limit]
+        all_pairs = all_pairs[:args.limit]
 
-    print(f"Stage 4: FITS download (binning={binning})")
-    print(f"  Candidates: {len(candidates)}")
-    print(f"  Max plates/candidate: {args.plates_per_candidate}")
+    print(f"  Unique pairs: {len(all_pairs)}")
+    print(f"  Binning: {binning}")
     print(f"  Already downloaded: {len(done)}")
 
-    n_total_ok = 0
-    n_total_err = 0
+    n_ok = 0
+    n_err = 0
 
     with tempfile.TemporaryDirectory(prefix="dasch_sess_") as sess_tmp:
-        for cand in tqdm(candidates, desc="Candidates", unit="src"):
-            # Limit plates per candidate to keep download manageable
-            vasco_id = cand["vasco_id"]
-            plates = get_window_plates(vasco_id, date_start, date_end)
-            # Prioritize plates near the middle of the window (peak POSS-I era)
-            plates_to_try = plates[:args.plates_per_candidate]
+        for vasco_id, plate_a, plate_b in tqdm(all_pairs, desc="Pairs", unit="pair"):
+            pair_id = make_pair_id(plate_a, plate_b)
+            out_dir = FITS_DIR / pair_id
+            out_dir.mkdir(parents=True, exist_ok=True)
 
-            n_ok, n_err = download_for_candidate(
-                cand, binning, date_start, date_end, done, Path(sess_tmp)
-            )
-            n_total_ok += n_ok
-            n_total_err += n_err
+            pid_a = plate_a.get("plate_id") or f"{plate_a['series']}{int(plate_a['platenum']):05d}"
+            pid_b = plate_b.get("plate_id") or f"{plate_b['series']}{int(plate_b['platenum']):05d}"
+            key_a = f"{pair_id}/{pid_a}_{binning:02d}"
+            key_b = f"{pair_id}/{pid_b}_{binning:02d}"
+
+            if key_a in done and key_b in done:
+                continue
+
+            # Create a daschlab session using the VASCO position
+            ra = float(plate_a.get("ra", 0))
+            dec = float(plate_a.get("dec", 0))
+            sess_path = Path(sess_tmp) / f"sess_{pair_id}"
+            sess = daschlab.open_session(root=str(sess_path), interactive=False)
+            sess.select_target(ra_deg=ra, dec_deg=dec)
+            try:
+                _ = sess.exposures()
+            except Exception:
+                pass
+
+            for plate, pid, key in [(plate_a, pid_a, key_a), (plate_b, pid_b, key_b)]:
+                if key in done:
+                    continue
+                dest = out_dir / f"{pid}_{binning:02d}.fits"
+                if download_plate(sess, plate, binning, dest, sess_path):
+                    done.add(key)
+                    n_ok += 1
+                else:
+                    n_err += 1
+
             save_done(done)
 
     print(f"\n=== Stage 4 Complete ===")
-    print(f"Downloaded: {n_total_ok} FITS files, {n_total_err} skipped")
+    print(f"Downloaded: {n_ok} FITS files, {n_err} skipped")
     print(f"Output: {FITS_DIR}")
-    print("\nSpot-check downloaded images, then run Stage 5 (source extraction).")
+    print("\nRun Stage 5 for transient detection on plate pairs.")
 
 
 if __name__ == "__main__":

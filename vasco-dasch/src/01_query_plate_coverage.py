@@ -64,7 +64,7 @@ def filter_to_window(plates: list, date_start: str, date_end: str) -> list:
 
 def query_one(client: DASCHClient, vasco_id: str, ra: float, dec: float,
               date_start: str, date_end: str) -> tuple[list, int]:
-    """Query coverage for one source. Returns (all_plates, n_in_window)."""
+    """Query coverage for one source. Returns (window_plates, n_in_window)."""
     raw = client.query_exposures(ra_deg=ra, dec_deg=dec)
     if not isinstance(raw, list) or len(raw) < 2:
         return [], 0
@@ -76,7 +76,7 @@ def query_one(client: DASCHClient, vasco_id: str, ra: float, dec: float,
         except (KeyError, ValueError):
             p["plate_id"] = ""
     in_window = filter_to_window(plates, date_start, date_end)
-    return plates, len(in_window)
+    return in_window, len(in_window)
 
 
 def main():
@@ -145,37 +145,51 @@ def main():
     print(f"Skipped {n_skipped} already-queried, {n_errors} polar")
     print(f"Querying {len(to_query)} remaining sources\n")
 
-    # Each worker gets its own client to avoid shared rate-limit state
-    def make_client():
-        return DASCHClient()
+    # Each worker gets its own persistent client
+    import threading
+    _thread_clients = {}
+    _client_lock = threading.Lock()
+
+    def get_thread_client():
+        tid = threading.current_thread().ident
+        if tid not in _thread_clients:
+            with _client_lock:
+                if tid not in _thread_clients:
+                    _thread_clients[tid] = DASCHClient()
+        return _thread_clients[tid]
 
     def worker_fn(item):
         vasco_id, ra, dec = item
-        c = make_client()
+        c = get_thread_client()
         try:
             plates, n_window = query_one(c, vasco_id, ra, dec, date_start, date_end)
             return (vasco_id, ra, dec, plates, n_window, None)
         except Exception as e:
             return (vasco_id, ra, dec, [], 0, e)
 
+    # Submit in batches to bound memory: at most 2*n_workers futures in flight
+    batch_size = n_workers * 2
     with tqdm(total=len(to_query), unit="src", initial=0) as pbar:
         with ThreadPoolExecutor(max_workers=n_workers) as pool:
-            futures = {pool.submit(worker_fn, item): item for item in to_query}
-            for future in as_completed(futures):
-                vasco_id, ra, dec, plates, n_window, err = future.result()
-                if err:
-                    tqdm.write(f"  ERROR {vasco_id} ({ra:.4f},{dec:.4f}): {err}")
-                    n_errors += 1
-                    save_coverage(vasco_id, ra, dec, [], 0)
-                else:
-                    save_coverage(vasco_id, ra, dec, plates, n_window)
-                    n_queried += 1
-                    if n_window > 0:
-                        n_with_coverage += 1
+            for batch_start in range(0, len(to_query), batch_size):
+                batch = to_query[batch_start:batch_start + batch_size]
+                futures = {pool.submit(worker_fn, item): item for item in batch}
+                for future in as_completed(futures):
+                    vasco_id, ra, dec, plates, n_window, err = future.result()
+                    if err:
+                        tqdm.write(f"  ERROR {vasco_id} ({ra:.4f},{dec:.4f}): {err}")
+                        n_errors += 1
+                        save_coverage(vasco_id, ra, dec, [], 0)
+                    else:
+                        save_coverage(vasco_id, ra, dec, plates, n_window)
+                        n_queried += 1
+                        if n_window > 0:
+                            n_with_coverage += 1
 
-                pbar.update(1)
-                pbar.set_postfix(queried=n_queried,
-                                 coverage=n_with_coverage, errors=n_errors)
+                    pbar.update(1)
+                    pbar.set_postfix(queried=n_queried,
+                                     coverage=n_with_coverage, errors=n_errors)
+                del futures
 
     print(f"\n=== Stage 1 Complete ===")
     print(f"Newly queried : {n_queried}")

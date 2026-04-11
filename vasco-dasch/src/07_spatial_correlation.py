@@ -1,7 +1,7 @@
-"""Stage 7: Spatial correlation analysis.
+"""Stage 7: Spatial correlation — Harvard transients vs VASCO positions.
 
-Standalone script that runs the spatial correlation test from Stage 6
-but with more detailed output and the ability to use custom parameters.
+Tests whether independently-detected Harvard transients cluster near
+VASCO transient positions more than expected by chance.
 
 Usage:
     poetry run python src/07_spatial_correlation.py [--radius-arcsec 10] [--n-mc 10000]
@@ -9,14 +9,23 @@ Usage:
 
 import sys
 import argparse
-import numpy as np
 import pandas as pd
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
+from utils.database import get_harvard_transients
 from utils.statistics import spatial_correlation_mc
 
 RESULTS_DIR = Path(__file__).parent.parent / "data" / "results"
+CATALOG_DIR = Path(__file__).parent.parent / "data" / "vasco_catalog"
+
+
+def load_vasco_positions() -> pd.DataFrame:
+    for name in ["vetted_5399.csv", "full_107k.csv", "test_200.csv"]:
+        p = CATALOG_DIR / name
+        if p.exists():
+            return pd.read_csv(p)
+    raise FileNotFoundError("No VASCO catalog found")
 
 
 def main():
@@ -25,29 +34,28 @@ def main():
     parser.add_argument("--n-mc", type=int, default=5000)
     args = parser.parse_args()
 
-    cands_csv = RESULTS_DIR / "candidates.csv"
-    if not cands_csv.exists():
-        print("Run Stage 3 first.")
-        return
-
-    df = pd.read_csv(cands_csv)
-    singles = df[df["flag"] == "SINGLE_DETECTION"]
+    transients = get_harvard_transients()
+    vasco = load_vasco_positions()
 
     print(f"Spatial correlation test")
-    print(f"  Single-detection candidates: {len(singles)}")
-    print(f"  Total VASCO positions: {len(df)}")
+    print(f"  Harvard transients: {len(transients)}")
+    print(f"  VASCO positions: {len(vasco)}")
     print(f"  Match radius: {args.radius_arcsec} arcsec")
     print(f"  Monte Carlo shuffles: {args.n_mc}")
 
-    if len(singles) == 0:
-        print("No single-detection candidates. Cannot run test.")
+    if len(transients) == 0:
+        print("No Harvard transients. Cannot run test.")
         return
 
+    import numpy as np
+    test_ra = np.array([t["ra"] for t in transients])
+    test_dec = np.array([t["dec"] for t in transients])
+
     result = spatial_correlation_mc(
-        test_ra=singles["ra"].values,
-        test_dec=singles["dec"].values,
-        ref_ra=df["ra"].values,
-        ref_dec=df["dec"].values,
+        test_ra=test_ra,
+        test_dec=test_dec,
+        ref_ra=vasco["ra"].values,
+        ref_dec=vasco["dec"].values,
         n_mc=args.n_mc,
         radius_arcsec=args.radius_arcsec,
     )
@@ -61,10 +69,10 @@ def main():
 
     if result["significant"]:
         if result["z_score"] > 0:
-            print("\nINTERPRETATION: Harvard single detections cluster near VASCO positions")
-            print("  → Consistent with VASCO transients being real astrophysical events")
+            print("\nINTERPRETATION: Harvard transients cluster near VASCO positions")
+            print("  → Consistent with a real astrophysical transient population")
         else:
-            print("\nINTERPRETATION: Harvard single detections ANTI-cluster near VASCO positions")
+            print("\nINTERPRETATION: Harvard transients ANTI-cluster near VASCO positions")
     else:
         print("\nINTERPRETATION: No significant spatial correlation found")
         print("  → Harvard data neither confirms nor refutes VASCO positions")

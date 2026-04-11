@@ -64,6 +64,19 @@ def init_db():
             n_window        INTEGER,
             notes           TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS harvard_transients (
+            transient_id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            ra              REAL,
+            dec             REAL,
+            plate_id        TEXT,
+            series          TEXT,
+            expdate         TEXT,
+            mag             REAL,
+            pair_id         TEXT,
+            fwhm            REAL,
+            snr             REAL
+        );
         """)
 
 
@@ -128,6 +141,39 @@ def get_positions_with_window_coverage() -> list:
             "SELECT vasco_id, ra, dec FROM plate_coverage WHERE n_window > 0"
         ).fetchall()
     return [(r["vasco_id"], r["ra"], r["dec"]) for r in rows]
+
+
+def save_harvard_transient(ra: float, dec: float, plate_id: str, series: str,
+                           expdate: str, mag: float, pair_id: str,
+                           fwhm: float, snr: float):
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO harvard_transients
+               (ra, dec, plate_id, series, expdate, mag, pair_id, fwhm, snr)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (ra, dec, plate_id, series, expdate, mag, pair_id, fwhm, snr),
+        )
+
+
+def save_harvard_transients_batch(records: list[dict]):
+    with get_conn() as conn:
+        conn.executemany(
+            """INSERT INTO harvard_transients
+               (ra, dec, plate_id, series, expdate, mag, pair_id, fwhm, snr)
+               VALUES (:ra, :dec, :plate_id, :series, :expdate, :mag, :pair_id, :fwhm, :snr)""",
+            records,
+        )
+
+
+def get_harvard_transients() -> list[dict]:
+    with get_conn() as conn:
+        rows = conn.execute("SELECT * FROM harvard_transients").fetchall()
+    return [dict(r) for r in rows]
+
+
+def clear_harvard_transients():
+    with get_conn() as conn:
+        conn.execute("DELETE FROM harvard_transients")
 
 
 def get_refcat_for_lightcurve() -> list:

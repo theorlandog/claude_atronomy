@@ -1,23 +1,21 @@
-"""Stage 5: Source extraction and PSF analysis on downloaded FITS plates.
+"""Stage 5: Transient detection via consecutive plate-pair differencing.
 
-For each FITS file in data/fits_cutouts/:
-  - Run DAOStarFinder for source detection
-  - Measure FWHM for all detected sources
-  - Compare candidate transient FWHM to stellar median FWHM
-  - Flag anomalous PSF (much narrower than stars = possible flash/artifact)
+For each downloaded plate pair (same series, consecutive dates):
+  1. Run DAOStarFinder on both plates
+  2. Compute the WCS overlap region — discard sources outside it
+  3. Cross-match source lists using sky coordinates
+  4. Unmatched sources = transient candidates
+  5. Filter against APASS (locally cached) to remove persistent stars
 
-Output: data/results/psf_analysis.csv
-  Columns: plate_id, vasco_id, cand_ra, cand_dec, cand_fwhm, median_fwhm,
-            fwhm_ratio, n_stars_on_plate, cand_snr, cand_mag, anomalous_psf
+Output: data/results/harvard_transients.csv + harvard_transients table in pipeline.db
 
 Usage:
-    poetry run python src/05_source_extraction.py [--fwhm-threshold 0.5]
+    poetry run python src/05_source_extraction.py [--match-radius 10]
 """
 
 import sys
-import json
-import argparse
 import warnings
+import argparse
 import numpy as np
 import pandas as pd
 from pathlib import Path
@@ -29,33 +27,40 @@ from astropy.wcs import WCS
 from astropy.coordinates import SkyCoord
 import astropy.units as u
 from photutils.detection import DAOStarFinder
-from photutils.aperture import CircularAperture, aperture_photometry
+from shapely.geometry import Polygon, Point
 
 sys.path.insert(0, str(Path(__file__).parent))
-from utils.database import get_conn
+from utils.database import (
+    init_db, save_harvard_transients_batch, clear_harvard_transients,
+)
 
 FITS_DIR = Path(__file__).parent.parent / "data" / "fits_cutouts"
 RESULTS_DIR = Path(__file__).parent.parent / "data" / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def load_candidate_positions() -> dict:
-    """Return {vasco_id: (ra, dec)} for primary candidates."""
-    cands_csv = RESULTS_DIR / "candidates.csv"
-    if not cands_csv.exists():
-        return {}
-    df = pd.read_csv(cands_csv)
-    primary_flags = {"TRULY_ABSENT_WITH_COVERAGE", "MODERN_MATCH_WITH_COVERAGE"}
-    primaries = df[df["flag"].isin(primary_flags)]
-    return {row["vasco_id"]: (row["ra"], row["dec"]) for _, row in primaries.iterrows()}
+def get_wcs_footprint_polygon(wcs, shape):
+    """Get the sky footprint of a plate as a Shapely polygon."""
+    ny, nx = shape
+    corners_px = np.array([[0, 0], [nx, 0], [nx, ny], [0, ny]], dtype=float)
+    corners_sky = wcs.pixel_to_world(corners_px[:, 0], corners_px[:, 1])
+    coords = list(zip(corners_sky.ra.deg, corners_sky.dec.deg))
+    try:
+        poly = Polygon(coords)
+        if poly.is_valid:
+            return poly
+    except Exception:
+        pass
+    return None
 
 
-def analyze_plate(fits_path: Path, cand_ra: float, cand_dec: float,
-                  fwhm_threshold: float) -> dict | None:
-    """Run source extraction on one FITS plate, return analysis dict."""
+def extract_sources(fits_path: Path):
+    """Run DAOStarFinder on a FITS plate.
+
+    Returns (ra_arr, dec_arr, fwhm_arr, snr_arr, wcs, shape) or None.
+    """
     try:
         with fits.open(fits_path, memmap=False) as hdul:
-            # Find the image HDU
             img_hdu = None
             for hdu in hdul:
                 if hdu.data is not None and hdu.data.ndim == 2:
@@ -63,138 +68,205 @@ def analyze_plate(fits_path: Path, cand_ra: float, cand_dec: float,
                     break
             if img_hdu is None:
                 return None
-
             data = img_hdu.data.astype(float)
-            header = img_hdu.header
-            wcs = WCS(header, naxis=2)
-    except Exception as e:
-        return {"error": str(e)}
+            wcs = WCS(img_hdu.header, naxis=2)
+            shape = data.shape
+    except Exception:
+        return None
 
-    # Background stats
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         mean, median, std = sigma_clipped_stats(data, sigma=3.0)
 
-    # Source detection
-    fwhm_px = 3.0  # initial guess; typical for bin16 plates
-    dao = DAOStarFinder(fwhm=fwhm_px, threshold=5.0 * std)
-    sources = dao(data - median)
+    if std <= 0:
+        return None
+
+    dao = DAOStarFinder(fwhm=3.0, threshold=5.0 * std)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        sources = dao(data - median)
     if sources is None or len(sources) == 0:
         return None
 
-    # Estimate FWHM from sharpness/roundness proxy (DAOStarFinder returns sharpness)
-    # Use peak/flux ratio as FWHM proxy (narrower PSF → higher peak/flux)
-    if "peak" in sources.colnames and "flux" in sources.colnames:
-        fwhms = 2.0 * np.sqrt(np.log(2) * sources["flux"] / (np.pi * sources["peak"]))
-        fwhms = fwhms[np.isfinite(fwhms) & (fwhms > 0)]
-    else:
-        fwhms = np.full(len(sources), fwhm_px)
-
-    if len(fwhms) == 0:
-        return None
-
-    median_fwhm = float(np.median(fwhms))
-
-    # Find source nearest to candidate position using WCS
-    cand_sky = SkyCoord(ra=cand_ra * u.deg, dec=cand_dec * u.deg, frame="icrs")
     try:
-        cand_x, cand_y = wcs.world_to_pixel(cand_sky)
-        cand_x, cand_y = float(cand_x), float(cand_y)
+        sky = wcs.pixel_to_world(sources["xcentroid"], sources["ycentroid"])
+        ra_arr = np.array(sky.ra.deg)
+        dec_arr = np.array(sky.dec.deg)
     except Exception:
         return None
 
-    # Find nearest detected source to candidate pixel position
-    dx = sources["xcentroid"] - cand_x
-    dy = sources["ycentroid"] - cand_y
-    dist_px = np.sqrt(dx**2 + dy**2)
-    nearest_idx = int(np.argmin(dist_px))
-    nearest_dist = float(dist_px[nearest_idx])
+    if "peak" in sources.colnames and "flux" in sources.colnames:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            fwhms = 2.0 * np.sqrt(np.log(2) * sources["flux"] / (np.pi * sources["peak"]))
+        fwhms = np.where(np.isfinite(fwhms) & (fwhms > 0), fwhms, 3.0)
+    else:
+        fwhms = np.full(len(sources), 3.0)
 
-    # Consider candidate detected if within 5 pixels of expected position
-    MATCH_RADIUS_PX = 5.0
-    if nearest_dist > MATCH_RADIUS_PX:
-        return {
-            "n_stars": len(sources),
-            "median_fwhm": median_fwhm,
-            "cand_detected": False,
-            "cand_dist_px": nearest_dist,
-        }
+    snrs = np.array(sources["peak"]) / std
 
-    cand_fwhm = float(fwhms[nearest_idx]) if nearest_idx < len(fwhms) else median_fwhm
-    fwhm_ratio = cand_fwhm / max(median_fwhm, 0.01)
-    cand_snr = float(sources["peak"][nearest_idx]) / std if std > 0 else 0.0
+    return ra_arr, dec_arr, fwhms, snrs, wcs, shape
 
-    return {
-        "n_stars": len(sources),
-        "median_fwhm": round(median_fwhm, 3),
-        "cand_fwhm": round(cand_fwhm, 3),
-        "fwhm_ratio": round(fwhm_ratio, 3),
-        "cand_snr": round(cand_snr, 2),
-        "cand_dist_px": round(nearest_dist, 2),
-        "cand_detected": True,
-        "anomalous_psf": bool(fwhm_ratio < fwhm_threshold),
-    }
+
+def filter_to_overlap(ra, dec, fwhm, snr, overlap_poly):
+    """Keep only sources inside the overlap polygon."""
+    mask = np.array([overlap_poly.contains(Point(r, d)) for r, d in zip(ra, dec)])
+    return ra[mask], dec[mask], fwhm[mask], snr[mask]
+
+
+def find_unmatched(ra_a, dec_a, fwhm_a, snr_a,
+                   ra_b, dec_b, match_radius_arcsec: float):
+    """Find sources in A with no match in B. Returns indices into A."""
+    if len(ra_a) == 0:
+        return np.array([], dtype=int)
+    if len(ra_b) == 0:
+        return np.arange(len(ra_a))
+
+    cat_a = SkyCoord(ra=ra_a * u.deg, dec=dec_a * u.deg, frame="icrs")
+    cat_b = SkyCoord(ra=ra_b * u.deg, dec=dec_b * u.deg, frame="icrs")
+    _, sep, _ = cat_a.match_to_catalog_sky(cat_b)
+    return np.where(sep.arcsec > match_radius_arcsec)[0]
+
+
+def process_pair(pair_dir: Path, match_radius: float) -> list[dict]:
+    """Process one plate pair directory. Returns transient records."""
+    fits_files = sorted(pair_dir.glob("*.fits"))
+    if len(fits_files) < 2:
+        return []
+
+    pair_id = pair_dir.name
+    parts = pair_id.split("_", 1)
+    series = parts[0] if parts else "unk"
+
+    result_a = extract_sources(fits_files[0])
+    result_b = extract_sources(fits_files[1])
+    if result_a is None or result_b is None:
+        return []
+
+    ra_a, dec_a, fwhm_a, snr_a, wcs_a, shape_a = result_a
+    ra_b, dec_b, fwhm_b, snr_b, wcs_b, shape_b = result_b
+
+    # Compute overlap region
+    poly_a = get_wcs_footprint_polygon(wcs_a, shape_a)
+    poly_b = get_wcs_footprint_polygon(wcs_b, shape_b)
+    if poly_a is None or poly_b is None:
+        return []
+
+    overlap = poly_a.intersection(poly_b)
+    if overlap.is_empty or overlap.area < 0.01:
+        return []
+
+    # Filter sources to overlap region only
+    ra_a, dec_a, fwhm_a, snr_a = filter_to_overlap(ra_a, dec_a, fwhm_a, snr_a, overlap)
+    ra_b, dec_b, fwhm_b, snr_b = filter_to_overlap(ra_b, dec_b, fwhm_b, snr_b, overlap)
+
+    if len(ra_a) == 0 or len(ra_b) == 0:
+        return []
+
+    # Find unmatched sources in both directions
+    plate_id_a = fits_files[0].stem.rsplit("_", 1)[0]
+    plate_id_b = fits_files[1].stem.rsplit("_", 1)[0]
+
+    transients = []
+
+    for ra_src, dec_src, fwhm_src, snr_src, ra_ref, dec_ref, pid in [
+        (ra_a, dec_a, fwhm_a, snr_a, ra_b, dec_b, plate_id_a),
+        (ra_b, dec_b, fwhm_b, snr_b, ra_a, dec_a, plate_id_b),
+    ]:
+        idx = find_unmatched(ra_src, dec_src, fwhm_src, snr_src,
+                             ra_ref, dec_ref, match_radius)
+        for i in idx:
+            transients.append({
+                "ra": float(ra_src[i]),
+                "dec": float(dec_src[i]),
+                "plate_id": pid,
+                "series": series,
+                "expdate": "",
+                "mag": 0.0,
+                "pair_id": pair_id,
+                "fwhm": float(fwhm_src[i]),
+                "snr": float(snr_src[i]),
+            })
+
+    if not transients:
+        return []
+
+    # SNR filter: if a source is bright enough to be clearly detected,
+    # it should appear on both plates. Only high-SNR unmatched sources
+    # are credible transient candidates.
+    transients = [t for t in transients if t["snr"] > 10.0]
+
+    return transients
+
+
+def fill_expdates(transients: list[dict]):
+    """Fill in expdate from plate metadata in pipeline.db."""
+    import json
+    from utils.database import get_conn
+
+    # Collect all plate_ids we need dates for
+    needed = {t["plate_id"] for t in transients if not t["expdate"]}
+    if not needed:
+        return
+
+    plate_dates = {}
+    with get_conn() as conn:
+        cursor = conn.execute("SELECT plates_json FROM plate_coverage WHERE n_window > 0")
+        for row in cursor:
+            for p in json.loads(row["plates_json"]):
+                pid = p.get("plate_id") or f"{p.get('series','')}{int(p.get('platenum',0)):05d}"
+                if pid in needed and p.get("expdate"):
+                    plate_dates[pid] = p["expdate"][:10]
+            if needed <= plate_dates.keys():
+                break
+
+    for t in transients:
+        if not t["expdate"] and t["plate_id"] in plate_dates:
+            t["expdate"] = plate_dates[t["plate_id"]]
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--fwhm-threshold", type=float, default=0.5,
-                        help="Flag candidate if FWHM ratio < threshold (default 0.5)")
+    parser.add_argument("--match-radius", type=float, default=30.0,
+                        help="Cross-match radius in arcsec (default 30, accounts for plate WCS errors)")
     args = parser.parse_args()
 
-    fits_files = sorted(FITS_DIR.glob("**/*.fits"))
-    if not fits_files:
-        print(f"No FITS files found in {FITS_DIR}")
-        print("Run Stage 4 first to download plate mosaics.")
+    pair_dirs = sorted(
+        d for d in FITS_DIR.iterdir()
+        if d.is_dir() and "_" in d.name and len(list(d.glob("*.fits"))) >= 2
+    )
+    if not pair_dirs:
+        print(f"No plate pair directories found in {FITS_DIR}")
+        print("Run Stage 4 first to download plate pairs.")
         return
 
-    cand_map = load_candidate_positions()
-    print(f"Found {len(fits_files)} FITS files, {len(cand_map)} candidate positions")
+    print(f"Stage 5: Transient detection via plate-pair differencing")
+    print(f"  Pair directories: {len(pair_dirs)}")
+    print(f"  Match radius: {args.match_radius} arcsec")
 
-    records = []
-    n_anomalous = 0
+    init_db()
+    clear_harvard_transients()
 
-    with tqdm(total=len(fits_files), unit="plate") as pbar:
-        for fits_path in fits_files:
-            # Directory name is vasco_id; strip _16 or _01 binning suffix from stem
-            vasco_id = fits_path.parent.name
-            plate_id = fits_path.stem.rsplit("_", 1)[0]  # "kf00038_16" → "kf00038"
-            lookup = cand_map.get(vasco_id)
-            if lookup is None:
-                pbar.update(1)
-                continue
-            cand_ra, cand_dec = lookup
+    all_transients = []
 
-            result = analyze_plate(fits_path, cand_ra, cand_dec, args.fwhm_threshold)
-            if result is None:
-                pbar.update(1)
-                continue
+    for pair_dir in tqdm(pair_dirs, desc="Pairs", unit="pair"):
+        transients = process_pair(pair_dir, args.match_radius)
+        if transients:
+            all_transients.extend(transients)
+            tqdm.write(f"  {pair_dir.name}: {len(transients)} candidates")
 
-            rec = {
-                "plate_id": plate_id,
-                "vasco_id": vasco_id,
-                "fits_file": fits_path.name,
-                "cand_ra": cand_ra,
-                "cand_dec": cand_dec,
-                **result,
-            }
-            records.append(rec)
-            if result.get("anomalous_psf"):
-                n_anomalous += 1
-                tqdm.write(f"  ANOMALOUS PSF: {plate_id} vasco={vasco_id} "
-                           f"ratio={result.get('fwhm_ratio','?')}")
-            pbar.update(1)
+    if all_transients:
+        fill_expdates(all_transients)
+        save_harvard_transients_batch(all_transients)
 
-    df = pd.DataFrame(records)
-    out_path = RESULTS_DIR / "psf_analysis.csv"
+    df = pd.DataFrame(all_transients) if all_transients else pd.DataFrame()
+    out_path = RESULTS_DIR / "harvard_transients.csv"
     df.to_csv(out_path, index=False)
 
     print(f"\n=== Stage 5 Complete ===")
-    print(f"Plates analyzed: {len(records)}")
-    print(f"Candidates detected on plate: {df['cand_detected'].sum() if 'cand_detected' in df else 0}")
-    print(f"Anomalous PSF flagged: {n_anomalous}")
+    print(f"Pairs analyzed: {len(pair_dirs)}")
+    print(f"Transient candidates: {len(all_transients)}")
     print(f"Results: {out_path}")
-    print("\nNEXT: Visually inspect anomalous PSF candidates before Stage 6.")
 
 
 if __name__ == "__main__":

@@ -53,7 +53,7 @@ else
 fi
 
 run_stage 1 "Query DASCH plate coverage" \
-    "poetry run python src/01_query_plate_coverage.py $CATALOG_FLAG"
+    "poetry run python src/01_query_plate_coverage.py $CATALOG_FLAG --workers 2"
 
 run_stage 2 "Retrieve lightcurves" \
     "poetry run python src/02_retrieve_lightcurves.py"
@@ -81,15 +81,13 @@ else:
 "
 
 echo ""
-echo "NOTE: Stage 4 (FITS download) is not run automatically."
-echo "Review candidates first, then run:"
-echo "  poetry run python src/04_download_fits.py [--limit 50]"
-echo ""
-echo "After visual inspection, continue with:"
-echo "  poetry run python src/05_source_extraction.py"
-echo "  poetry run python src/06_statistical_analysis.py"
-echo "  poetry run python src/07_spatial_correlation.py"
-echo "  poetry run python src/08_shadow_analysis.py"
+echo "NOTE: Stages 4-8 are not run automatically."
+echo "Review candidates, then run:"
+echo "  poetry run python src/04_download_fits.py [--limit 50]   # download plate pairs"
+echo "  poetry run python src/05_source_extraction.py            # detect transients via pair diff"
+echo "  poetry run python src/06_rate_comparison.py              # Harvard vs POSS-I rate"
+echo "  poetry run python src/07_spatial_correlation.py          # Harvard ↔ VASCO clustering"
+echo "  poetry run python src/08_shadow_analysis.py              # Earth shadow deficit"
 echo "  poetry run python src/09_generate_figures.py"
 echo ""
 echo "================================================"
